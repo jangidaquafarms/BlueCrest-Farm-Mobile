@@ -138,10 +138,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Ar
 }
 .app-fixed-header > div:first-child > div{position:relative;z-index:1;}
 #headerHomeTitle{font-weight:900!important;letter-spacing:-.02em;}
-@media(max-width:420px){
-  #headerHomeTitle{display:block;}
-  .app-fixed-header > div:first-child > div > div:first-child{min-width:0;}
-}
 #headerSubtitleDate{color:#c9d9e7!important;}
 #syncStatusBadge{background:rgba(255,255,255,.09)!important;border-color:rgba(255,255,255,.16)!important;color:#dbeafe!important;backdrop-filter:blur(8px);}
 #pondSelector,#mobileYearSelector,#mobileCropSelector{background:rgba(255,255,255,.10)!important;border-color:rgba(255,255,255,.18)!important;color:#fff!important;}
@@ -275,13 +271,13 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
         <div class="app-fixed-header bg-white shadow-sm">
             <div class="bg-blue-600 text-white p-4 shadow-md">
                 <div class="max-w-md mx-auto flex justify-between items-center">
-                    <div class="flex-1 min-w-0 flex items-center space-x-3">
-                        <div class="min-w-0">
+                    <div class="flex items-center space-x-3">
+                        <div>
                             <div id="headerPondSection" class="hidden">
                                 <select id="pondSelector" onchange="changePond(this.value)" class="bg-blue-700 hover:bg-blue-800 text-white font-bold text-lg rounded-xl w-32 px-3 py-1 outline-none cursor-pointer border border-blue-400/60 shadow-sm transition">
                                 </select>
                             </div>
-                            <div id="headerHomeTitle" class="text-lg font-bold whitespace-nowrap" style="display:block;">Elite Aqualines</div>
+                            <div id="headerHomeTitle" class="text-lg font-bold">Elite Aqualines</div>
                             <div id="headerCycleControls" class="flex items-center gap-1.5 mt-1">
                                 <select id="mobileYearSelector" onchange="changeMobileCycleYear(this.value)"
                                     class="bg-blue-700 text-white text-[11px] font-bold rounded-lg px-1.5 py-1 border border-blue-400/60 outline-none">
@@ -295,7 +291,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                             <p id="headerSubtitleDate" class="text-xs text-blue-100 pl-0.5 pt-0.5 font-medium"></p>
                         </div>
                     </div>
-                    <div class="flex-shrink-0 flex items-center space-x-3 text-lg">
+                    <div class="flex items-center space-x-3 text-lg">
                         <span id="syncStatusBadge" class="text-xs font-extrabold bg-blue-700 px-2 py-1 rounded-full border border-blue-400/40 text-blue-100 flex items-center gap-1" title="Real-time Cloud Sync Active">
                             <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span> Cloud Sync
                         </span>
@@ -848,9 +844,15 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 </div>
 
                 <form id="feedForm" onsubmit="handleFormSubmit(event)" class="space-y-4 text-sm">
-                    <div>
-                        <label class="block text-xs font-semibold text-slate-600 mb-1">Feeding Date *</label>
-                        <input type="date" id="feedingDate" required class="w-full border border-slate-200 p-2.5 rounded-lg outline-none focus:ring-2 focus:ring-blue-500">
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-600 mb-1">Pond *</label>
+                            <select id="feedPond" required onchange="onFeedPondChange(this.value)" class="w-full border border-slate-200 p-2.5 rounded-lg outline-none focus:ring-2 focus:ring-blue-500 bg-white font-bold text-xs"></select>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-600 mb-1">Feeding Date *</label>
+                            <input type="date" id="feedingDate" required class="w-full border border-slate-200 p-2.5 rounded-lg outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
                     </div>
 
                     <div>
@@ -1114,6 +1116,9 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
         let samplingEntries = JSON.parse(localStorage.getItem('bc_sampling')) || [];
         let treatmentEntries = JSON.parse(localStorage.getItem('bc_treatments')) || [];
         let harvestEntries = JSON.parse(localStorage.getItem('bc_harvests')) || [];
+        // Stock transfers are created/managed from the laptop, but the mobile app
+        // must read them so Transfer-in ponds show their actual incoming stock.
+        let stockTransfers = JSON.parse(localStorage.getItem('bc_stockTransfers')) || [];
 
         const treatmentCatalog = {
             'Probiotics': [
@@ -1457,6 +1462,20 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 renderAllPondsSummary();
             }, err => console.error("Harvest sync error:", err));
 
+            // Stock transfers are written by the laptop and shared through the
+            // same Firestore collection. Mobile is read-only for this module,
+            // but must keep the transfer records in sync for Transfer-in ponds.
+            db.collection('stockTransfers').onSnapshot(snap => {
+                stockTransfers = snap.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                localStorage.setItem('bc_stockTransfers', JSON.stringify(stockTransfers));
+                syncPondDropdown();
+                renderPondList();
+                renderAllPondsSummary();
+            }, err => console.error("Stock transfers sync error:", err));
+
             // Finance is global: never filter these records by the active Year + Crop.
             db.collection('vendorTransactions').onSnapshot(snap => {
                 vendorTransactions = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -1491,13 +1510,26 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             return `${cycle}__${name}`;
         }
 
+        function logicalPondIdFromRef(ref) {
+            const raw = String(ref || '').trim();
+            if (!raw) return '';
+            const m = raw.match(/^POND_\d{4}_CROP_\d+_(P\d+)$/i);
+            if (m) return m[1].toUpperCase();
+            const m2 = raw.match(/(?:^|[_-])(P\d+)$/i);
+            if (m2) return m2[1].toUpperCase();
+            return raw.toUpperCase();
+        }
+
         function normalizePondRecord(raw, firestoreId = '') {
             const p = { ...(raw || {}) };
             const cycleId = String(
                 p.cycleId ||
                 `${Number(p.year || DEFAULT_CYCLE_YEAR)}|${String(p.crop || DEFAULT_CYCLE_CROP).toLowerCase()}`
             );
-            const id = String(p.id || p.name || p.pondName || firestoreId || '').trim().toUpperCase();
+            // Older pond documents used IDs such as POND_2026_CROP_2_P3.
+            // The operational pond ID is P3; keep the Firestore document ID separately.
+            const suppliedId = p.id || p.name || p.pondName || '';
+            const id = logicalPondIdFromRef(suppliedId || firestoreId);
             return {
                 ...p,
                 id,
@@ -1958,6 +1990,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
 
         function syncPondDropdown() {
             const selector = document.getElementById('pondSelector');
+            const feedPondSelect = document.getElementById('feedPond');
             const samplingPondSelect = document.getElementById('samplingPond');
             const samplingFilterSelect = document.getElementById('samplingPondFilterSelect');
             const treatmentPondSelect = document.getElementById('treatmentPond');
@@ -1966,6 +1999,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             const harvestFilterSelect = document.getElementById('harvestPondFilterSelect');
             
             selector.innerHTML = '';
+            if (feedPondSelect) feedPondSelect.innerHTML = '';
             if (samplingPondSelect) samplingPondSelect.innerHTML = '';
             if (treatmentPondSelect) treatmentPondSelect.innerHTML = '';
             if (harvestPondSelect) harvestPondSelect.innerHTML = '';
@@ -1994,6 +2028,13 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 opt.innerText = p.id;
                 if (p.id === currentPond) opt.selected = true;
                 selector.appendChild(opt);
+
+                if (feedPondSelect) {
+                    const fOpt = document.createElement('option');
+                    fOpt.value = p.id;
+                    fOpt.innerText = p.id;
+                    feedPondSelect.appendChild(fOpt);
+                }
 
                 if (samplingPondSelect) {
                     const sOpt = document.createElement('option');
@@ -2098,7 +2139,6 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 bottomBar.classList.remove('hidden');
                 headerPondSection.classList.remove('hidden');
                 headerHomeTitle.classList.add('hidden');
-                headerHomeTitle.style.display = 'none';
                 const pondDisplay = document.getElementById('currentFeedPondDisplay');
                 if (pondDisplay) pondDisplay.innerText = `Current: Pond ${currentPond}`;
                 renderHistory();
@@ -2106,7 +2146,6 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 bottomBar.classList.add('hidden');
                 headerPondSection.classList.add('hidden');
                 headerHomeTitle.classList.remove('hidden');
-                headerHomeTitle.style.display = 'block';
                 if (tab === 'home') renderAllPondsSummary();
                 if (tab === 'pond') renderPondList();
                 if (tab === 'sampling') renderSamplingList();
@@ -2126,6 +2165,15 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                     if (scrollContent) scrollContent.scrollTop = 0;
                 }, 50);
             });
+        }
+
+        function onFeedPondChange(pond) {
+            const c = getActiveCycle();
+            const activePonds = getActivePonds();
+            if (!activePonds.some(p => p.id === pond)) return;
+            const selected = activePonds.find(p => p.id === pond);
+            const subtitle = document.getElementById('modalSubtitle');
+            if (subtitle) subtitle.innerText = `Farm: Elite Aqualines ${c.year} ${c.crop} | ${selected?.id || pond}`;
         }
 
         function changePond(pond) {
@@ -2232,6 +2280,12 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                     .reduce((acc, curr) => acc + (curr.fasting ? 0 : (parseFloat(curr.qty) || 0)), 0);
 
                 const doc = calculateDOC(pond.stockingDate, latestSystemDate);
+                const transferIn = isTransferInPond(pond);
+                const transferSummary = transferIn ? getPondTransferInSummary(pond.id) : null;
+                const stockLabel = transferIn ? 'Transferred In' : 'Stocked';
+                const stockNumber = transferIn
+                    ? (transferSummary.number > 0 ? transferSummary.number.toLocaleString() : '0')
+                    : (pond.stockingCount ? pond.stockingCount.toLocaleString() : '0');
 
                 const card = document.createElement('div');
                 card.className = 'bg-white p-5 rounded-2xl shadow-sm border border-slate-100 space-y-3';
@@ -2240,6 +2294,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                         <div>
                             <h3 class="text-sm font-bold text-slate-800 uppercase tracking-wide">${pondId} DASHBOARD SUMMARY</h3>
                             <p class="text-xs text-slate-400 font-medium mt-0.5">${formattedDate}</p>
+                            <p class="text-xs text-slate-500 font-semibold mt-1">${stockLabel}: ${stockNumber} ${transferIn ? 'pcs' : 'PL'}</p>
                         </div>
                         <span class="text-lg font-black text-emerald-600">DOC ${doc}</span>
                     </div>
@@ -2259,6 +2314,32 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             updateHeaderDate();
         }
 
+        function getPondTransferInSummary(pondId) {
+            const moves = Array.isArray(stockTransfers) ? stockTransfers : [];
+            const pond = ponds.find(p => String(p.id) === String(pondId));
+            const pYear = pond ? Number(pond.year || 0) : 0;
+            const pCrop = pond ? String(pond.crop || '').trim().toLowerCase() : '';
+            const targetId = logicalPondIdFromRef(pondId);
+            const matching = moves.filter(t => {
+                const toRaw = t.toPondId || t.toPond || '';
+                const toId = logicalPondIdFromRef(toRaw);
+                const year = Number(t.year || t.cropYear || 0);
+                const crop = String(t.crop || t.cropCycle || '').trim().toLowerCase();
+                return toId === targetId
+                    && (!year || !pYear || year === pYear)
+                    && (!crop || !pCrop || crop === pCrop);
+            });
+            return {
+                number: matching.reduce((sum, t) => sum + Number(t.number ?? t.transferredNumber ?? t.count ?? 0), 0),
+                biomass: matching.reduce((sum, t) => sum + Number(t.biomass ?? t.transferredBiomass ?? 0), 0)
+            };
+        }
+
+        function isTransferInPond(pond) {
+            const type = String(pond?.pondType || pond?.type || '').trim().toLowerCase();
+            return type === 'transferin' || type === 'transfer-in';
+        }
+
         function renderPondList() {
             const container = document.getElementById('pondCardsList');
             const totalCountEl = document.getElementById('totalPondsCount');
@@ -2270,6 +2351,13 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             const activePonds = getActivePonds();
             activePonds.forEach(p => {
                 const doc = calculateDOC(p.stockingDate, latestSystemDate);
+                const transferIn = isTransferInPond(p);
+                const transferSummary = transferIn ? getPondTransferInSummary(p.id) : null;
+                const stockLabel = transferIn ? 'Transferred In' : 'Stocking Count';
+                const stockNumber = transferIn
+                    ? (transferSummary.number > 0 ? transferSummary.number.toLocaleString() : '0')
+                    : (p.stockingCount ? p.stockingCount.toLocaleString() : '0');
+                const stockUnit = transferIn ? 'pcs' : 'PL';
                 const card = document.createElement('div');
                 card.className = 'bg-white p-4 rounded-2xl border border-slate-100 shadow-sm space-y-2.5';
                 card.innerHTML = `
@@ -2292,8 +2380,8 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                             <span class="font-bold text-slate-700">${formatDateDisplay(p.stockingDate)}</span>
                         </div>
                         <div class="bg-slate-50 p-2 rounded-xl">
-                            <span class="text-slate-400 block text-[11px]">Stocking Count</span>
-                            <span class="font-bold text-slate-700">${p.stockingCount ? p.stockingCount.toLocaleString() : 0} PL</span>
+                            <span class="text-slate-400 block text-[11px]">${stockLabel}</span>
+                            <span class="font-bold text-slate-700">${stockNumber} ${stockUnit}</span>
                         </div>
                     </div>
                 `;
@@ -2808,6 +2896,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
         function handleFormSubmit(e) {
             if (isViewOnlyMode) { e.preventDefault(); alert('View-Only mode: data changes are disabled.'); return; }
             e.preventDefault();
+            const pond = document.getElementById('feedPond').value;
             const date = document.getElementById('feedingDate').value;
             const time = document.getElementById('selectedTimeString').innerText;
             const fasting = document.querySelector('input[name="fasting"][value="Yes"]').checked;
@@ -2841,17 +2930,24 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
 
             const c = getActiveCycle();
             const activePonds = getActivePonds();
-            if (!currentPond || !activePonds.some(p => p.id === currentPond)) {
+            if (!pond || !activePonds.some(p => p.id === pond)) {
                 alert(`Please select a pond from ${c.year} • ${c.crop}.`);
                 return;
             }
+            if (typeof blueCrestAssertOperationalWrite === 'function' &&
+                !blueCrestAssertOperationalWrite({pondId: pond, cycleId: c.id})) {
+                return;
+            }
+
+            // Keep the feed screen focused on the pond actually selected for this entry.
+            currentPond = pond;
 
             const id = editingEntryId !== null ? editingEntryId : Date.now();
             const existing = editingEntryId !== null ? feedEntries.find(e => e.id === editingEntryId) : null;
             const entryObj = {
                 ...(existing || {}),
                 id,
-                pond: currentPond,
+                pond,
                 year: Number(c.year),
                 crop: c.crop,
                 cycleId: c.id,
@@ -3546,19 +3642,24 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
         }
 
         function openModal(id = null) {
+            syncPondDropdown();
+            const feedPondSelect = document.getElementById('feedPond');
             document.getElementById('feedModal').classList.remove('hidden');
             const modalTitle = document.getElementById('modalTitleText');
-            document.getElementById('modalSubtitle').innerText = `Farm: Elite Aqualines 2026 C2 | ${currentPond}`;
+            document.getElementById('modalSubtitle').innerText = `Farm: Elite Aqualines ${getActiveCycle().year} ${getActiveCycle().crop} | ${currentPond}`;
 
             if (id !== null) {
                 editingEntryId = id;
-                modalTitle.innerText = `Edit Feed Data (${currentPond})`;
                 const entry = getActiveFeedEntries().find(e =>
                     String(e.id) === String(id) ||
                     String(e.firestoreId || '') === String(id) ||
                     String(e.legacyRecordId || '') === String(id)
                 );
                 if (entry) {
+                    const entryPond = String(entry.pond || currentPond || '');
+                    if (feedPondSelect) feedPondSelect.value = entryPond;
+                    onFeedPondChange(entryPond);
+                    modalTitle.innerText = `Edit Feed Data (${entryPond})`;
                     document.getElementById('feedingDate').value = entry.date;
                     const parts = entry.time.split(' ');
                     const hm = parts[0].split(':');
@@ -3591,7 +3692,10 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 }
             } else {
                 editingEntryId = null;
-                modalTitle.innerText = `Add Feed Data (${currentPond})`;
+                const selectedPond = currentPond || (getActivePonds().length ? getActivePonds()[0].id : '');
+                if (feedPondSelect) feedPondSelect.value = selectedPond;
+                onFeedPondChange(selectedPond);
+                modalTitle.innerText = `Add Feed Data (${selectedPond})`;
                 const now = new Date();
                 document.getElementById('feedingDate').value = now.toISOString().split('T')[0];
                 selectedHour = now.getHours();
