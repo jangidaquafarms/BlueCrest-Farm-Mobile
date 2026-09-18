@@ -1361,10 +1361,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             }, err => console.error("Ponds sync error:", err));
 
             db.collection('feeds').onSnapshot(snap => {
-                feedEntries = snap.docs.map(doc => {
-                    const d = doc.data() || {};
-                    return { ...d, id: doc.id, firestoreId: doc.id, legacyRecordId: d.id != null && String(d.id) !== String(doc.id) ? d.id : null };
-                });
+                feedEntries = snap.docs.map(doc => normalizeFeedRecord(doc.data() || {}, doc.id));
                 localStorage.setItem('bc_feeds', JSON.stringify(feedEntries));
                 recalculateCumulatives();
                 refreshForMobileCycleChange();
@@ -1499,6 +1496,97 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             return raw.toUpperCase();
         }
 
+        function recordCycleKey(record) {
+            if (record?.cycleId) return String(record.cycleId).trim().toLowerCase();
+            const year = Number(record?.year || record?.cropYear || DEFAULT_CYCLE_YEAR);
+            const crop = String(record?.crop || record?.cropCycle || DEFAULT_CYCLE_CROP).trim().toLowerCase();
+            return `${year}|${crop}`;
+        }
+
+        function isRecordInMobileCycle(record, cycle = getActiveCycle()) {
+            if (!record || !cycle) return false;
+            const activeKey = String(cycle.id || `${Number(cycle.year)}|${String(cycle.crop).toLowerCase()}`).trim().toLowerCase();
+            if (recordCycleKey(record) === activeKey) return true;
+            const year = Number(record.year || record.cropYear || 0);
+            const crop = String(record.crop || record.cropCycle || '').trim().toLowerCase();
+            const yearMatches = !year || year === Number(cycle.year);
+            const cropMatches = !crop || crop === String(cycle.crop || '').trim().toLowerCase();
+            return yearMatches && cropMatches && !record.cycleId;
+        }
+
+        function resolveOperationalPondId(ref, cycleId = '') {
+            const raw = String(ref || '').trim();
+            if (!raw) return '';
+            const logical = logicalPondIdFromRef(raw);
+            const wantedCycle = String(cycleId || '').trim().toLowerCase();
+            const matchesRef = (p) => {
+                const id = String(p?.id || '').trim();
+                const name = String(p?.name || p?.pondName || '').trim();
+                const rawLower = raw.toLowerCase();
+                return id.toLowerCase() === rawLower ||
+                    name.toLowerCase() === rawLower ||
+                    logicalPondIdFromRef(id) === logical ||
+                    logicalPondIdFromRef(name) === logical;
+            };
+            const cyclePonds = (Array.isArray(ponds) ? ponds : []).filter(p =>
+                !wantedCycle || recordCycleKey(p) === wantedCycle
+            );
+            const found = cyclePonds.find(matchesRef) || (Array.isArray(ponds) ? ponds : []).find(matchesRef);
+            return found ? String(found.id) : logical;
+        }
+
+        function feedMatchesPond(entry, pondId) {
+            const wanted = resolveOperationalPondId(pondId, entry?.cycleId);
+            const refs = [entry?.pond, entry?.pondId, entry?.pondName];
+            return refs.some(ref => {
+                if (!ref) return false;
+                const resolved = resolveOperationalPondId(ref, entry?.cycleId);
+                return resolved === wanted ||
+                    String(ref).trim().toLowerCase() === String(pondId || '').trim().toLowerCase();
+            });
+        }
+
+        function normalizeFeedRecord(raw, firestoreId = '') {
+            const d = raw || {};
+            const docId = String(firestoreId || d.firestoreId || d.id || Date.now());
+            const year = Number(d.year || d.cropYear || DEFAULT_CYCLE_YEAR);
+            const crop = d.crop || d.cropCycle || DEFAULT_CYCLE_CROP;
+            const cycleId = d.cycleId || `${year}|${String(crop).toLowerCase()}`;
+            const pond = resolveOperationalPondId(d.pondId || d.pond || d.pondName || '', cycleId);
+            const feeds = Array.isArray(d.feeds) ? d.feeds.map(f => ({
+                code: f.code || f.name || '',
+                qty: Number(f.qty || f.quantity || 0)
+            })).filter(f => f.code && Number(f.qty) > 0) : [];
+            const fasting = d.fasting === true || String(d.fasting || '').toLowerCase() === 'yes';
+            const qty = Number(d.qty != null ? d.qty : feeds.reduce((sum, f) => sum + Number(f.qty || 0), 0)) || 0;
+            const supplement = d.supplement && (d.supplement.code || d.supplement.name) ? {
+                code: d.supplement.code || d.supplement.name,
+                dose: Number(d.supplement.dose || 0),
+                qty: Number(d.supplement.qty || d.supplement.totalQty || 0)
+            } : null;
+            return {
+                ...d,
+                id: docId,
+                firestoreId: docId,
+                legacyRecordId: d.id != null && String(d.id) !== docId ? d.id : (d.legacyRecordId ?? null),
+                pond,
+                pondId: pond,
+                pondName: d.pondName || d.pond || pond,
+                year,
+                crop,
+                cropCycle: crop,
+                cycleId,
+                date: d.date || d.feedingDate || '',
+                time: d.time || d.feedingTime || '07:00 AM',
+                fasting,
+                feeds,
+                qty,
+                supplement,
+                cumulative: Number(d.cumulative || 0),
+                notes: d.notes || ''
+            };
+        }
+
         function normalizePondRecord(raw, firestoreId = '') {
             const p = { ...(raw || {}) };
             const cycleId = String(
@@ -1612,11 +1700,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
 
         function getActiveFeedEntries() {
             const c = getActiveCycle();
-            return feedEntries.filter(e => {
-                if (e.cycleId) return String(e.cycleId) === String(c.id);
-                return Number(e.year || DEFAULT_CYCLE_YEAR) === Number(c.year) &&
-                       String(e.crop || DEFAULT_CYCLE_CROP) === String(c.crop);
-            });
+            return feedEntries.filter(e => isRecordInMobileCycle(e, c));
         }
 
         async function saveFeedToDb(entryObj) {
@@ -1628,16 +1712,19 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 String(e.legacyRecordId || '') === String(sourceId)
             );
             const firestoreId = String(existing?.firestoreId || existing?.id || sourceId || Date.now());
-            const normalized = {
+            const pond = resolveOperationalPondId(entryObj.pond || entryObj.pondId || existing?.pond, c.id);
+            const normalized = normalizeFeedRecord({
                 ...(existing || {}),
                 ...entryObj,
                 id: firestoreId,
                 firestoreId,
                 legacyRecordId: existing?.legacyRecordId || (entryObj?.id != null && String(entryObj.id) !== firestoreId ? entryObj.id : null),
+                pond,
+                pondId: pond,
                 year: entryObj.year || Number(c.year),
                 crop: entryObj.crop || c.crop,
                 cycleId: entryObj.cycleId || c.id
-            };
+            }, firestoreId);
             if (isFirebaseConnected && db) {
                 await db.collection('feeds').doc(firestoreId).set(normalized);
             } else {
@@ -1950,23 +2037,27 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
 
         function getEntryTimestamp(entry) {
             if (!entry || !entry.date) return 0;
-            const parts = (entry.time || '12:00 AM').split(' ');
-            const hm = (parts[0] || '12:00').split(':');
+            const rawTime = String(entry.time || '12:00 AM').trim();
+            const ampm = rawTime.match(/\b(AM|PM)\b/i);
+            const hm = rawTime.replace(/\s*(AM|PM)\s*/ig, '').trim().split(':');
             let h = parseInt(hm[0], 10) || 0;
             const m = parseInt(hm[1], 10) || 0;
-            const mer = (parts[1] || 'AM').toUpperCase();
-            if (mer === 'PM' && h < 12) h += 12;
-            if (mer === 'AM' && h === 12) h = 0;
-            const [year, month, day] = entry.date.split('-').map(Number);
+            if (ampm) {
+                const mer = ampm[1].toUpperCase();
+                if (mer === 'PM' && h < 12) h += 12;
+                if (mer === 'AM' && h === 12) h = 0;
+            }
+            const [year, month, day] = String(entry.date).split('-').map(Number);
+            if (!year || !month || !day) return 0;
             return new Date(year, month - 1, day, h, m).getTime();
         }
 
         function recalculateCumulatives() {
             const groups = new Map();
             feedEntries.forEach(entry => {
-                const cycleKey = entry.cycleId ||
-                    `${Number(entry.year || DEFAULT_CYCLE_YEAR)}|${String(entry.crop || DEFAULT_CYCLE_CROP).toLowerCase()}`;
-                const key = `${cycleKey}__${entry.pond}`;
+                const cycleKey = recordCycleKey(entry);
+                const pondKey = resolveOperationalPondId(entry.pond || entry.pondId, entry.cycleId);
+                const key = `${cycleKey}__${pondKey}`;
                 if (!groups.has(key)) groups.set(key, []);
                 groups.get(key).push(entry);
             });
@@ -2457,7 +2548,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
 
             activePonds.forEach(pond => {
                 const pondId = pond.id;
-                const pondEntries = getActiveFeedEntries().filter(item => item.pond === pondId);
+                const pondEntries = getActiveFeedEntries().filter(item => feedMatchesPond(item, pondId));
                 
                 let tillTodayTotal = pondEntries.reduce((acc, curr) => acc + (curr.fasting ? 0 : (parseFloat(curr.qty) || 0)), 0);
                 let latestDateTotal = pondEntries
@@ -2586,7 +2677,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             const container = document.getElementById('feedHistoryList');
             container.innerHTML = '';
 
-            let pondEntries = getActiveFeedEntries().filter(item => item.pond === currentPond);
+            let pondEntries = getActiveFeedEntries().filter(item => feedMatchesPond(item, currentPond));
             pondEntries.sort((a, b) => {
                 let dtA = getEntryTimestamp(a);
                 let dtB = getEntryTimestamp(b);
@@ -2978,7 +3069,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
         function onHarvestPondChange(pondId) {
             if (editingHarvestId === null) {
                 const pondFeed = getActiveFeedEntries()
-                    .filter(e => e.pond === pondId)
+                    .filter(e => feedMatchesPond(e, pondId))
                     .reduce((acc, curr) => acc + (curr.fasting ? 0 : (parseFloat(curr.qty) || 0)), 0);
                 document.getElementById('harvestFeedConsumed').value = pondFeed > 0 ? pondFeed.toFixed(1) : '';
             }
@@ -3140,12 +3231,18 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             // Keep the feed screen focused on the pond actually selected for this entry.
             currentPond = pond;
 
-            const id = editingEntryId !== null ? editingEntryId : Date.now();
-            const existing = editingEntryId !== null ? feedEntries.find(e => e.id === editingEntryId) : null;
+            const id = editingEntryId !== null ? String(editingEntryId) : `f_${Date.now()}`;
+            const existing = editingEntryId !== null ? feedEntries.find(e =>
+                String(e.id) === String(editingEntryId) ||
+                String(e.firestoreId || '') === String(editingEntryId) ||
+                String(e.legacyRecordId || '') === String(editingEntryId)
+            ) : null;
             const entryObj = {
                 ...(existing || {}),
                 id,
                 pond,
+                pondId: pond,
+                pondName: pond,
                 year: Number(c.year),
                 crop: c.crop,
                 cycleId: c.id,
@@ -3864,7 +3961,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                     String(e.legacyRecordId || '') === String(id)
                 );
                 if (entry) {
-                    const entryPond = String(entry.pond || currentPond || '');
+                    const entryPond = resolveOperationalPondId(entry.pond || entry.pondId || currentPond, entry.cycleId) || currentPond;
                     if (feedPondSelect) feedPondSelect.value = entryPond;
                     onFeedPondChange(entryPond);
                     modalTitle.innerText = `Edit Feed Data (${entryPond})`;
