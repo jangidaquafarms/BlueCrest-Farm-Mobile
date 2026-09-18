@@ -100,7 +100,10 @@
     <link rel="apple-touch-icon" href="icon.png">
     <link rel="icon" type="image/png" href="icon.png">
 <style id="mobile-cycle-foundation-style">
-#headerCycleControls select{max-width:76px}
+#headerCycleControls{flex-wrap:nowrap;min-width:max-content}
+#headerCycleControls select{box-sizing:border-box}
+#mobileYearSelector{width:78px;min-width:78px;max-width:78px}
+#mobileCropSelector{width:108px;min-width:108px;max-width:108px}
 </style>
 <style id="mobile-feed-cycle-note-style">#mobile-feed-cycle-note{display:inline-flex;align-items:center;margin:.4rem 0 .7rem;padding:.3rem .65rem;border:1px solid #dbeafe;border-radius:999px;background:#eff6ff;color:#1d4ed8;font-size:.7rem;font-weight:700}</style>
 
@@ -340,9 +343,13 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             <!-- 3. Feed View -->
             <div id="feedView" class="hidden space-y-3">
                 <div class="flex justify-between items-center bg-white p-3 rounded-2xl border border-slate-100 shadow-sm">
-                    <div>
+                    <div class="min-w-0">
                         <h3 class="text-sm font-bold text-slate-800 uppercase tracking-wide">Feed Tracking</h3>
-                        <p class="text-xs text-slate-400" id="currentFeedPondDisplay">Current: Pond P2</p>
+                        <div class="mt-1 flex items-center gap-2">
+                            <label for="feedPondFilter" class="text-[11px] font-semibold text-slate-400">Pond</label>
+                            <select id="feedPondFilter" onchange="changePond(this.value)" class="text-xs font-bold text-blue-700 bg-blue-50 border border-blue-100 rounded-lg px-2 py-1 outline-none focus:ring-2 focus:ring-blue-400 min-w-[88px]">
+                            </select>
+                        </div>
                     </div>
                     <button id="feedRecordBtn" onclick="blueCrestOpenFeedRecord()" class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3.5 py-2 rounded-xl shadow-sm transition flex items-center gap-1.5">
                         <span>+</span> Record Feed
@@ -1901,30 +1908,117 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
         }
 
         function getGrowthFromLastSample(targetSample) {
-            const targetCycle = targetSample.cycleId || `${Number(targetSample.year || DEFAULT_CYCLE_YEAR)}|${String(targetSample.crop || DEFAULT_CYCLE_CROP).toLowerCase()}`;
+            // Keep mobile Gain logic aligned with the laptop Sampling logic:
+            // match the same logical pond and cycle, while tolerating legacy
+            // sampling records that may not contain an explicit cycleId.
+            const normalizePondId = (value) => {
+                const raw = String(value || '').trim();
+                const m = raw.match(/(?:^|_)p(\d+)$/i);
+                return m ? `P${m[1]}` : raw.toUpperCase();
+            };
+
+            const targetPond = normalizePondId(
+                targetSample.pond || targetSample.pondId || targetSample.pondName
+            );
+            const targetYear = Number(targetSample.year || targetSample.cropYear || DEFAULT_CYCLE_YEAR);
+            const targetCrop = String(
+                targetSample.crop || targetSample.cropCycle || DEFAULT_CYCLE_CROP
+            ).trim().toLowerCase();
+            const targetCycle = String(
+                targetSample.cycleId ||
+                `${targetYear}|${targetCrop}`
+            ).trim().toLowerCase();
+            const targetId = String(targetSample.id);
+            const targetDate = new Date(`${targetSample.date}T00:00:00`).getTime();
+
             const earlierSamples = samplingEntries
-                .filter(s => s.pond === targetSample.pond && s.id !== targetSample.id)
-                .filter(s => String(s.cycleId || `${Number(s.year || DEFAULT_CYCLE_YEAR)}|${String(s.crop || DEFAULT_CYCLE_CROP).toLowerCase()}`) === String(targetCycle))
+                .filter(s => normalizePondId(s.pond || s.pondId || s.pondName) === targetPond)
                 .filter(s => {
-                    const dateDiff = new Date(targetSample.date + 'T00:00:00') - new Date(s.date + 'T00:00:00');
-                    if (dateDiff > 0) return true;
-                    if (dateDiff === 0) return s.id < targetSample.id;
+                    // If a previous record has an explicit cycle tag, it must
+                    // belong to the same cycle. Legacy records without a cycle
+                    // tag remain eligible when their available year/crop data
+                    // is compatible with the target cycle.
+                    const sYearRaw = s.year || s.cropYear;
+                    const sCropRaw = s.crop || s.cropCycle;
+                    const sCycleRaw = s.cycleId;
+
+                    if (sCycleRaw) {
+                        return String(sCycleRaw).trim().toLowerCase() === targetCycle;
+                    }
+
+                    const sYear = sYearRaw ? Number(sYearRaw) : 0;
+                    const sCrop = sCropRaw ? String(sCropRaw).trim().toLowerCase() : '';
+                    const yearMatches = !sYear || sYear === targetYear;
+                    const cropMatches = !sCrop || sCrop === targetCrop;
+                    return yearMatches && cropMatches;
+                })
+                .filter(s => String(s.id) !== targetId)
+                .filter(s => {
+                    const sampleDate = new Date(`${s.date}T00:00:00`).getTime();
+                    if (sampleDate < targetDate) return true;
+                    if (sampleDate === targetDate) return String(s.id) < targetId;
                     return false;
                 })
-                .sort((a, b) => new Date(b.date + 'T00:00:00') - new Date(a.date + 'T00:00:00') || b.id - a.id);
+                .sort((a, b) => {
+                    const dateDiff =
+                        new Date(`${b.date}T00:00:00`).getTime() -
+                        new Date(`${a.date}T00:00:00`).getTime();
+                    if (dateDiff !== 0) return dateDiff;
+                    return String(b.id).localeCompare(String(a.id), undefined, {numeric:true});
+                });
 
             if (earlierSamples.length === 0) {
+                // First sampling of a Transfer-in pond has no previous sampling
+                // record. In that case the opening biological reference is the
+                // weighted ABW of shrimp actually transferred into this pond.
+                const pond = ponds.find(p => normalizePondId(p?.id || p?.name || p?.pondName) === targetPond);
+                if (pond && isTransferInPond(pond)) {
+                    const transferSummary = getPondTransferInSummary(pond.id, targetSample.date);
+                    const transferAbw = Number(transferSummary?.abw);
+                    const currentAbw = Number(
+                        targetSample.abw != null
+                            ? targetSample.abw
+                            : ((Number(targetSample.sampleWeight || targetSample.testWeight || 0) > 0 &&
+                                Number(targetSample.count || 0) > 0)
+                                ? Number(targetSample.sampleWeight || targetSample.testWeight) / Number(targetSample.count)
+                                : 0)
+                    );
+                    if (Number.isFinite(currentAbw) && currentAbw > 0 &&
+                        Number.isFinite(transferAbw) && transferAbw > 0) {
+                        const diff = currentAbw - transferAbw;
+                        const sign = diff >= 0 ? '+' : '';
+                        return { hasPrev: true, diff, text: `${sign}${diff.toFixed(2)} gm` };
+                    }
+                }
                 return { hasPrev: false, diff: 0, text: '--' };
             }
 
             const prev = earlierSamples[0];
-            const diff = targetSample.abw - prev.abw;
+            const currentWeight = Number(
+                targetSample.abw != null
+                    ? targetSample.abw
+                    : ((Number(targetSample.sampleWeight || targetSample.testWeight || 0) > 0 &&
+                        Number(targetSample.count || 0) > 0)
+                        ? Number(targetSample.sampleWeight || targetSample.testWeight) / Number(targetSample.count)
+                        : 0)
+            );
+            const previousWeight = Number(
+                prev.abw != null
+                    ? prev.abw
+                    : ((Number(prev.sampleWeight || prev.testWeight || 0) > 0 &&
+                        Number(prev.count || 0) > 0)
+                        ? Number(prev.sampleWeight || prev.testWeight) / Number(prev.count)
+                        : 0)
+            );
+
+            if (!Number.isFinite(currentWeight) || !Number.isFinite(previousWeight) ||
+                currentWeight <= 0 || previousWeight <= 0) {
+                return { hasPrev: false, diff: 0, text: '--' };
+            }
+
+            const diff = currentWeight - previousWeight;
             const sign = diff >= 0 ? '+' : '';
-            return {
-                hasPrev: true,
-                diff: diff,
-                text: `${sign}${diff.toFixed(2)} gm`
-            };
+            return { hasPrev: true, diff, text: `${sign}${diff.toFixed(2)} gm` };
         }
 
         function getLatestCumulativeForPond(pondId, excludeSampleId = null) {
@@ -1991,6 +2085,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
         function syncPondDropdown() {
             const selector = document.getElementById('pondSelector');
             const feedPondSelect = document.getElementById('feedPond');
+            const feedPondFilter = document.getElementById('feedPondFilter');
             const samplingPondSelect = document.getElementById('samplingPond');
             const samplingFilterSelect = document.getElementById('samplingPondFilterSelect');
             const treatmentPondSelect = document.getElementById('treatmentPond');
@@ -2000,6 +2095,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             
             selector.innerHTML = '';
             if (feedPondSelect) feedPondSelect.innerHTML = '';
+            if (feedPondFilter) feedPondFilter.innerHTML = '';
             if (samplingPondSelect) samplingPondSelect.innerHTML = '';
             if (treatmentPondSelect) treatmentPondSelect.innerHTML = '';
             if (harvestPondSelect) harvestPondSelect.innerHTML = '';
@@ -2034,6 +2130,13 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                     fOpt.value = p.id;
                     fOpt.innerText = p.id;
                     feedPondSelect.appendChild(fOpt);
+                }
+                if (feedPondFilter) {
+                    const ffOpt = document.createElement('option');
+                    ffOpt.value = p.id;
+                    ffOpt.innerText = p.id;
+                    if (p.id === currentPond) ffOpt.selected = true;
+                    feedPondFilter.appendChild(ffOpt);
                 }
 
                 if (samplingPondSelect) {
@@ -2139,8 +2242,8 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 bottomBar.classList.remove('hidden');
                 headerPondSection.classList.remove('hidden');
                 headerHomeTitle.classList.add('hidden');
-                const pondDisplay = document.getElementById('currentFeedPondDisplay');
-                if (pondDisplay) pondDisplay.innerText = `Current: Pond ${currentPond}`;
+                const feedPondFilter = document.getElementById('feedPondFilter');
+                if (feedPondFilter) feedPondFilter.value = currentPond || '';
                 renderHistory();
             } else {
                 bottomBar.classList.add('hidden');
@@ -2174,10 +2277,18 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             const selected = activePonds.find(p => p.id === pond);
             const subtitle = document.getElementById('modalSubtitle');
             if (subtitle) subtitle.innerText = `Farm: Elite Aqualines ${c.year} ${c.crop} | ${selected?.id || pond}`;
+            const feedPondFilter = document.getElementById('feedPondFilter');
+            if (feedPondFilter) feedPondFilter.value = pond;
         }
 
         function changePond(pond) {
+            const activePonds = getActivePonds();
+            if (!activePonds.some(p => p.id === pond)) return;
             currentPond = pond;
+            const feedPondFilter = document.getElementById('feedPondFilter');
+            if (feedPondFilter) feedPondFilter.value = currentPond;
+            const headerSelector = document.getElementById('pondSelector');
+            if (headerSelector) headerSelector.value = currentPond;
             const pondDisplay = document.getElementById('currentFeedPondDisplay');
             if (pondDisplay) pondDisplay.innerText = `Current: Pond ${currentPond}`;
             renderHistory();
@@ -2314,7 +2425,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             updateHeaderDate();
         }
 
-        function getPondTransferInSummary(pondId) {
+        function getPondTransferInSummary(pondId, asOfDate = null) {
             const moves = Array.isArray(stockTransfers) ? stockTransfers : [];
             const pond = ponds.find(p => String(p.id) === String(pondId));
             const pYear = pond ? Number(pond.year || 0) : 0;
@@ -2325,13 +2436,21 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 const toId = logicalPondIdFromRef(toRaw);
                 const year = Number(t.year || t.cropYear || 0);
                 const crop = String(t.crop || t.cropCycle || '').trim().toLowerCase();
+                const transferDate = String(t.date || '').trim();
+                const dateMatches = !asOfDate || !transferDate || transferDate <= String(asOfDate);
                 return toId === targetId
                     && (!year || !pYear || year === pYear)
-                    && (!crop || !pCrop || crop === pCrop);
+                    && (!crop || !pCrop || crop === pCrop)
+                    && dateMatches;
             });
+            const number = matching.reduce((sum, t) => sum + Number(t.number ?? t.transferredNumber ?? t.count ?? 0), 0);
+            const biomass = matching.reduce((sum, t) => sum + Number(t.biomass ?? t.transferredBiomass ?? 0), 0);
             return {
-                number: matching.reduce((sum, t) => sum + Number(t.number ?? t.transferredNumber ?? t.count ?? 0), 0),
-                biomass: matching.reduce((sum, t) => sum + Number(t.biomass ?? t.transferredBiomass ?? 0), 0)
+                number,
+                biomass,
+                // Transfer-in opening ABW is derived from the actual stock
+                // transferred into this pond: biomass (kg) × 1000 ÷ pieces.
+                abw: number > 0 && biomass > 0 ? (biomass * 1000) / number : null
             };
         }
 
@@ -2405,8 +2524,13 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
 
             dates.forEach(dateStr => {
                 const dateHeader = document.createElement('div');
-                dateHeader.className = 'text-xs font-bold text-slate-500 bg-slate-100 p-2 rounded mt-3 mb-2';
-                dateHeader.innerText = `(${currentPond}) ${dateStr}`;
+                dateHeader.className = 'flex items-center gap-2 text-xs font-bold text-slate-500 bg-slate-100 p-2 rounded mt-3 mb-2';
+                const pondForDate = getActivePonds().find(p => p.id === currentPond);
+                const dateDoc = pondForDate ? calculateDOC(pondForDate.stockingDate, dateStr) : '-';
+                dateHeader.innerHTML = `
+                    <span>(${currentPond}) ${dateStr}</span>
+                    <span class="text-[10px] font-black text-emerald-700 bg-emerald-50 border border-emerald-100 px-2 py-0.5 rounded">DOC ${dateDoc}</span>
+                `;
                 container.appendChild(dateHeader);
 
                 const entriesForDate = pondEntries.filter(e => e.date === dateStr);
@@ -2514,10 +2638,10 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                     const doc = pondObj ? calculateDOC(pondObj.stockingDate, item.date) : '-';
                     const growthInfo = getGrowthFromLastSample(item);
 
-                    let growthHtml = `<div class="bg-slate-50 p-2 rounded-xl border border-slate-100"><span class="text-[10px] text-slate-400 font-medium block">Growth</span><span class="font-bold text-slate-400 text-xs">--</span></div>`;
+                    let growthHtml = `<div class="bg-slate-50 p-2 rounded-xl border border-slate-100"><span class="text-[10px] text-slate-400 font-medium block">Gain</span><span class="font-bold text-slate-400 text-xs">--</span></div>`;
                     if (growthInfo.hasPrev) {
                         const isGain = growthInfo.diff >= 0;
-                        growthHtml = `<div class="${isGain ? 'bg-blue-50/70 border-blue-100 text-blue-700' : 'bg-rose-50 border-rose-100 text-rose-700'} p-2 rounded-xl border"><span class="text-[10px] block font-semibold">Growth</span><span class="font-extrabold text-xs">${growthInfo.text}</span></div>`;
+                        growthHtml = `<div class="${isGain ? 'bg-blue-50/70 border-blue-100 text-blue-700' : 'bg-rose-50 border-rose-100 text-rose-700'} p-2 rounded-xl border"><span class="text-[10px] block font-semibold">Gain</span><span class="font-extrabold text-xs">${growthInfo.text}</span></div>`;
                     }
 
                     const netFeedVal = item.netFeed !== undefined 
@@ -3838,8 +3962,35 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
         }
 
         function toggleFasting(isFasting) {
-            document.getElementById('feedProductsSection').style.display = isFasting ? 'none' : 'block';
-            document.getElementById('supplementProductsSection').style.display = isFasting ? 'none' : 'block';
+            const feedSection = document.getElementById('feedProductsSection');
+            const supplementSection = document.getElementById('supplementProductsSection');
+            if (feedSection) feedSection.style.display = isFasting ? 'none' : 'block';
+            if (supplementSection) supplementSection.style.display = isFasting ? 'none' : 'block';
+
+            // Hidden feed/supplement controls must not participate in browser
+            // validation. Otherwise a Fasting=Yes entry is blocked because the
+            // hidden feed row still contains required inputs.
+            document.querySelectorAll('#feedProductsSection input, #feedProductsSection select').forEach(el => {
+                if (isFasting) {
+                    el.dataset.fastingRequired = el.required ? '1' : '0';
+                    el.required = false;
+                    el.disabled = true;
+                } else {
+                    el.disabled = false;
+                    if (el.dataset.fastingRequired === '1') el.required = true;
+                    delete el.dataset.fastingRequired;
+                }
+            });
+
+            document.querySelectorAll('#supplementProductsSection input, #supplementProductsSection select').forEach(el => {
+                if (isFasting) {
+                    el.dataset.fastingDisabled = '1';
+                    el.disabled = true;
+                } else {
+                    el.disabled = false;
+                    delete el.dataset.fastingDisabled;
+                }
+            });
         }
 
         function openClockPicker() { document.getElementById('clockModal').classList.remove('hidden'); switchClockMode('hour'); }
