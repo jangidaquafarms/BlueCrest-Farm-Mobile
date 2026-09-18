@@ -1371,38 +1371,10 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             }, err => console.error("Feeds sync error:", err));
 
             db.collection('sampling').onSnapshot(snap => {
-                samplingEntries = snap.docs.map(doc => {
-                    const d = doc.data() || {};
-                    const year = Number(d.year || d.cropYear || DEFAULT_CYCLE_YEAR);
-                    const crop = d.crop || d.cropCycle || DEFAULT_CYCLE_CROP;
-                    const cycleId = d.cycleId || `${year}|${String(crop).toLowerCase()}`;
-                    const pond = d.pond || d.pondId || d.pondName || '';
-                    const sampleWeight = Number(d.sampleWeight != null ? d.sampleWeight : (d.testWeight || 0));
-                    const prevCumulativeFeed = Number(d.prevCumulativeFeed != null ? d.prevCumulativeFeed : (d.lastFeed || 0));
-                    const currCumulativeFeed = d.currCumulativeFeed != null ? Number(d.currCumulativeFeed) : (d.currentFeed != null ? Number(d.currentFeed) : null);
-                    const netFeed = Number(d.netFeed != null ? d.netFeed : ((currCumulativeFeed != null ? currCumulativeFeed : 0) - prevCumulativeFeed));
-                    return {
-                        ...d,
-                        id: doc.id,
-                        firestoreId: doc.id,
-                        legacyRecordId: d.id != null ? d.id : null,
-                        pond,
-                        pondId: d.pondId || pond,
-                        year, crop, cycleId,
-                        sampleWeight,
-                        testWeight: Number(d.testWeight != null ? d.testWeight : sampleWeight),
-                        count: Number(d.count || 0),
-                        abw: Number(d.abw != null ? d.abw : (sampleWeight > 0 && Number(d.count || 0) > 0 ? sampleWeight / Number(d.count) : 0)),
-                        prevCumulativeFeed,
-                        lastFeed: prevCumulativeFeed,
-                        currCumulativeFeed,
-                        currentFeed: currCumulativeFeed,
-                        netFeed,
-                        notes: d.notes || ''
-                    };
-                });
+                samplingEntries = snap.docs.map(doc => normalizeSamplingRecord(doc.data() || {}, doc.id));
                 localStorage.setItem('bc_sampling', JSON.stringify(samplingEntries));
                 renderSamplingList();
+                if (!isViewOnlyMode) repairSamplingDocsForLaptop(snap);
             }, err => console.error("Sampling sync error:", err));
 
             db.collection('treatments').onSnapshot(snap => {
@@ -1723,6 +1695,106 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             }
         }
 
+        function newSamplingRecordId() {
+            return `s_${Date.now()}`;
+        }
+
+        function stripUndefinedForFirestore(value) {
+            if (Array.isArray(value)) return value.map(stripUndefinedForFirestore);
+            if (value && typeof value === 'object') {
+                const out = {};
+                Object.keys(value).forEach(key => {
+                    const v = value[key];
+                    if (v === undefined) return;
+                    if (typeof v === 'number' && !Number.isFinite(v)) return;
+                    out[key] = (v && typeof v === 'object' && !(v instanceof Date) && typeof v.toDate !== 'function')
+                        ? stripUndefinedForFirestore(v)
+                        : v;
+                });
+                return out;
+            }
+            return value;
+        }
+
+        function normalizeSamplingRecord(raw, firestoreId = '') {
+            const d = raw || {};
+            const docId = String(firestoreId || d.firestoreId || d.id || newSamplingRecordId());
+            const year = Number(d.year || d.cropYear || DEFAULT_CYCLE_YEAR);
+            const crop = d.crop || d.cropCycle || DEFAULT_CYCLE_CROP;
+            const cycleId = d.cycleId || `${year}|${String(crop).toLowerCase()}`;
+            const pond = String(d.pond || d.pondId || d.pondName || '').trim();
+            const pondName = String(d.pondName || d.pond || pond).trim();
+            const date = String(d.date || d.samplingDate || '').trim();
+            const sampleWeight = Number(d.sampleWeight != null ? d.sampleWeight : (d.testWeight || 0));
+            const count = Number(d.count || 0);
+            const prevCumulativeFeed = Number(d.prevCumulativeFeed != null ? d.prevCumulativeFeed : (d.lastFeed || 0));
+            const currCumulativeFeed = d.currCumulativeFeed != null ? Number(d.currCumulativeFeed)
+                : (d.currentFeed != null ? Number(d.currentFeed) : null);
+            const netFeed = Number(d.netFeed != null ? d.netFeed
+                : ((currCumulativeFeed != null ? currCumulativeFeed : 0) - prevCumulativeFeed));
+            const abw = Number(d.abw != null ? d.abw
+                : (sampleWeight > 0 && count > 0 ? sampleWeight / count : 0));
+            const storedId = d.id;
+            const legacyRecordId = (storedId != null && String(storedId) !== docId) ? storedId : (d.legacyRecordId ?? null);
+            return {
+                ...d,
+                id: docId,
+                firestoreId: docId,
+                legacyRecordId,
+                pond,
+                pondId: pond,
+                pondName,
+                date,
+                samplingDate: date,
+                year,
+                cropYear: year,
+                crop,
+                cropCycle: crop,
+                cycleId,
+                sampleWeight,
+                testWeight: sampleWeight,
+                count,
+                abw,
+                prevCumulativeFeed,
+                lastFeed: prevCumulativeFeed,
+                currCumulativeFeed,
+                currentFeed: currCumulativeFeed,
+                netFeed,
+                notes: d.notes || ''
+            };
+        }
+
+        function samplingNeedsLaptopRepair(raw, firestoreId) {
+            const d = raw || {};
+            const pond = d.pond || d.pondId || d.pondName || '';
+            if (d.id != null && typeof d.id !== 'string') return true;
+            if (String(d.id || '') !== String(firestoreId)) return true;
+            if (pond && d.pondId == null) return true;
+            if (d.sampleWeight != null && d.testWeight == null) return true;
+            if (d.prevCumulativeFeed != null && d.lastFeed == null) return true;
+            if (d.currCumulativeFeed != null && d.currentFeed == null) return true;
+            return false;
+        }
+
+        const samplingLaptopRepairInFlight = new Set();
+        function repairSamplingDocsForLaptop(snap) {
+            if (!isFirebaseConnected || !db || !snap) return;
+            snap.docs.forEach(doc => {
+                const data = doc.data() || {};
+                if (!samplingNeedsLaptopRepair(data, doc.id)) {
+                    samplingLaptopRepairInFlight.delete(doc.id);
+                    return;
+                }
+                if (samplingLaptopRepairInFlight.has(doc.id)) return;
+                samplingLaptopRepairInFlight.add(doc.id);
+                const payload = stripUndefinedForFirestore(normalizeSamplingRecord(data, doc.id));
+                db.collection('sampling').doc(doc.id).set(payload, { merge: true }).catch(err => {
+                    samplingLaptopRepairInFlight.delete(doc.id);
+                    console.error('Sampling laptop-compat repair error:', err);
+                });
+            });
+        }
+
         async function saveSamplingToDb(sampleObj) {
             const c = getActiveCycle();
             // When an older/mobile record carries a legacy numeric ID, the edit form
@@ -1735,20 +1807,22 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 String(s.firestoreId || '') === String(sourceId) ||
                 String(s.legacyRecordId || '') === String(sourceId)
             );
-            const firestoreId = existing?.firestoreId || existing?.id || String(sourceId);
-            const normalized = {
+            const firestoreId = String(existing?.firestoreId || existing?.id || sourceId || newSamplingRecordId());
+            const normalized = stripUndefinedForFirestore(normalizeSamplingRecord({
                 ...(existing || {}),
                 ...sampleObj,
                 id: firestoreId,
                 firestoreId,
-                legacyRecordId: existing?.legacyRecordId ?? sampleObj?.legacyRecordId ?? null,
+                legacyRecordId: existing?.legacyRecordId ?? (
+                    sampleObj?.id != null && String(sampleObj.id) !== firestoreId ? sampleObj.id : null
+                ),
                 year: Number(c.year),
                 crop: c.crop,
                 cycleId: c.id
-            };
+            }, firestoreId));
             if (isFirebaseConnected && db) {
                 try {
-                    await db.collection('sampling').doc(String(firestoreId)).set(normalized, { merge: true });
+                    await db.collection('sampling').doc(firestoreId).set(normalized, { merge: true });
                     return true;
                 } catch (err) {
                     console.error('Firestore sampling write error:', err);
@@ -2026,7 +2100,7 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
             const pondSamples = samplingEntries
                 .filter(s => s.pond === pondId && (excludeSampleId === null || s.id !== excludeSampleId))
                 .filter(s => String(s.cycleId || `${Number(s.year || DEFAULT_CYCLE_YEAR)}|${String(s.crop || DEFAULT_CYCLE_CROP).toLowerCase()}`) === String(c.id))
-                .sort((a, b) => new Date(b.date + 'T00:00:00') - new Date(a.date + 'T00:00:00') || b.id - a.id);
+                .sort((a, b) => new Date(b.date + 'T00:00:00') - new Date(a.date + 'T00:00:00') || String(b.id).localeCompare(String(a.id), undefined, {numeric:true}));
 
             if (pondSamples.length === 0) return 0;
             return parseFloat(pondSamples[0].currCumulativeFeed) || 0;
@@ -3122,19 +3196,26 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                 alert(`Pond ${pond} does not belong to ${c.year} ${c.crop}.`);
                 return;
             }
-            const id = editingSampleId !== null ? editingSampleId : Date.now();
+            const id = editingSampleId !== null ? String(editingSampleId) : newSamplingRecordId();
             const sampleObj = { 
                 id, 
                 date, 
                 pond,
+                pondId: pond,
+                pondName: pond,
                 year: Number(c.year),
+                cropYear: Number(c.year),
                 crop: c.crop,
+                cropCycle: c.crop,
                 cycleId: c.id, 
-                sampleWeight, 
+                sampleWeight,
+                testWeight: sampleWeight,
                 count, 
                 abw, 
-                prevCumulativeFeed, 
-                currCumulativeFeed, 
+                prevCumulativeFeed,
+                lastFeed: prevCumulativeFeed,
+                currCumulativeFeed,
+                currentFeed: currCumulativeFeed,
                 netFeed,
                 notes 
             };
@@ -3454,13 +3535,16 @@ input:focus,select:focus,textarea:focus{border-color:#4d91b8!important;box-shado
                     const r = rows[i];
                     if(r.length < 6 || !r[0]) continue;
                     saveSamplingToDb({
-                        id: parseInt(r[0], 10) || Date.now() + i,
-                        date: r[1], pond: r[2],
+                        id: String(r[0] || newSamplingRecordId()),
+                        date: r[1], pond: r[2], pondId: r[2], pondName: r[2],
                         sampleWeight: parseFloat(r[3]) || 0,
+                        testWeight: parseFloat(r[3]) || 0,
                         count: parseInt(r[4], 10) || 0,
                         abw: parseFloat(r[5]) || 0,
                         prevCumulativeFeed: parseFloat(r[7]) || 0,
+                        lastFeed: parseFloat(r[7]) || 0,
                         currCumulativeFeed: parseFloat(r[8]) || 0,
+                        currentFeed: parseFloat(r[8]) || 0,
                         netFeed: parseFloat(r[9]) || 0,
                         notes: r[11] || ""
                     });
